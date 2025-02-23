@@ -1,6 +1,6 @@
 import { getExecuteCommandDescription } from "./execute-command"
 import { getReadFileDescription } from "./read-file"
-import { getWriteToFileDescription } from "./write-to-file"
+import { getWriteToFileDescription } from "./create-file"
 import { getSearchFilesDescription } from "./search-files"
 import { getListFilesDescription } from "./list-files"
 import { getInsertContentDescription } from "./insert-content"
