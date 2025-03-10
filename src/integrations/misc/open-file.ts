@@ -31,7 +31,7 @@ export async function openFile(filePath: string, options: OpenFileOptions = {}) 
 		const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath
 
 		// If path starts with ./, resolve it relative to workspace root if available
-		// Otherwise, treat it as an absolute path
+		// Otherwise, use the path as provided without modification
 		const fullPath = filePath.startsWith("./")
 			? workspaceRoot
 				? path.join(workspaceRoot, filePath.slice(2))
