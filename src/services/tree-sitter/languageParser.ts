@@ -3,6 +3,7 @@ import Parser from "web-tree-sitter"
 import {
 	javascriptQuery,
 	typescriptQuery,
+	tsxQuery,
 	pythonQuery,
 	rustQuery,
 	goQuery,
@@ -13,6 +14,7 @@ import {
 	javaQuery,
 	phpQuery,
 	swiftQuery,
+	kotlinQuery,
 } from "./queries"
 
 export interface LanguageParser {
@@ -67,6 +69,7 @@ export async function loadRequiredLanguageParsers(filesToParse: string[]): Promi
 		switch (ext) {
 			case "js":
 			case "jsx":
+			case "json":
 				language = await loadLanguage("javascript")
 				query = language.query(javascriptQuery)
 				break
@@ -76,7 +79,7 @@ export async function loadRequiredLanguageParsers(filesToParse: string[]): Promi
 				break
 			case "tsx":
 				language = await loadLanguage("tsx")
-				query = language.query(typescriptQuery)
+				query = language.query(tsxQuery)
 				break
 			case "py":
 				language = await loadLanguage("python")
@@ -119,6 +122,11 @@ export async function loadRequiredLanguageParsers(filesToParse: string[]): Promi
 			case "swift":
 				language = await loadLanguage("swift")
 				query = language.query(swiftQuery)
+				break
+			case "kt":
+			case "kts":
+				language = await loadLanguage("kotlin")
+				query = language.query(kotlinQuery)
 				break
 			default:
 				throw new Error(`Unsupported language: ${ext}`)

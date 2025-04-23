@@ -1,27 +1,35 @@
 import { Anthropic } from "@anthropic-ai/sdk"
+import axios from "axios"
 import OpenAI from "openai"
-import { ApiHandler, SingleCompletionHandler } from "../"
+
 import { ApiHandlerOptions, ModelInfo, unboundDefaultModelId, unboundDefaultModelInfo } from "../../shared/api"
 import { convertToOpenAiMessages } from "../transform/openai-format"
 import { ApiStream, ApiStreamUsageChunk } from "../transform/stream"
+import { SingleCompletionHandler } from "../"
+import { BaseProvider } from "./base-provider"
 
 interface UnboundUsage extends OpenAI.CompletionUsage {
 	cache_creation_input_tokens?: number
 	cache_read_input_tokens?: number
 }
 
-export class UnboundHandler implements ApiHandler, SingleCompletionHandler {
-	private options: ApiHandlerOptions
+export class UnboundHandler extends BaseProvider implements SingleCompletionHandler {
+	protected options: ApiHandlerOptions
 	private client: OpenAI
 
 	constructor(options: ApiHandlerOptions) {
+		super()
 		this.options = options
 		const baseURL = "https://api.getunbound.ai/v1"
 		const apiKey = this.options.unboundApiKey ?? "not-provided"
 		this.client = new OpenAI({ baseURL, apiKey })
 	}
 
-	async *createMessage(systemPrompt: string, messages: Anthropic.Messages.MessageParam[]): ApiStream {
+	private supportsTemperature(): boolean {
+		return !this.getModel().id.startsWith("openai/o3-mini")
+	}
+
+	override async *createMessage(systemPrompt: string, messages: Anthropic.Messages.MessageParam[]): ApiStream {
 		// Convert Anthropic messages to OpenAI format
 		const openAiMessages: OpenAI.Chat.ChatCompletionMessageParam[] = [
 			{ role: "system", content: systemPrompt },
@@ -71,31 +79,33 @@ export class UnboundHandler implements ApiHandler, SingleCompletionHandler {
 		let maxTokens: number | undefined
 
 		if (this.getModel().id.startsWith("anthropic/")) {
-			maxTokens = 8_192
+			maxTokens = this.getModel().info.maxTokens ?? undefined
+		}
+
+		const requestOptions: OpenAI.Chat.Completions.ChatCompletionCreateParamsStreaming = {
+			model: this.getModel().id.split("/")[1],
+			max_tokens: maxTokens,
+			messages: openAiMessages,
+			stream: true,
+		}
+
+		if (this.supportsTemperature()) {
+			requestOptions.temperature = this.options.modelTemperature ?? 0
 		}
 
 		const { data: completion, response } = await this.client.chat.completions
-			.create(
-				{
-					model: this.getModel().id.split("/")[1],
-					max_tokens: maxTokens,
-					temperature: this.options.modelTemperature ?? 0,
-					messages: openAiMessages,
-					stream: true,
+			.create(requestOptions, {
+				headers: {
+					"X-Unbound-Metadata": JSON.stringify({
+						labels: [
+							{
+								key: "app",
+								value: "roo-code",
+							},
+						],
+					}),
 				},
-				{
-					headers: {
-						"X-Unbound-Metadata": JSON.stringify({
-							labels: [
-								{
-									key: "app",
-									value: "roo-code",
-								},
-							],
-						}),
-					},
-				},
-			)
+			})
 			.withResponse()
 
 		for await (const chunk of completion) {
@@ -129,7 +139,7 @@ export class UnboundHandler implements ApiHandler, SingleCompletionHandler {
 		}
 	}
 
-	getModel(): { id: string; info: ModelInfo } {
+	override getModel(): { id: string; info: ModelInfo } {
 		const modelId = this.options.unboundModelId
 		const modelInfo = this.options.unboundModelInfo
 		if (modelId && modelInfo) {
@@ -146,14 +156,28 @@ export class UnboundHandler implements ApiHandler, SingleCompletionHandler {
 			const requestOptions: OpenAI.Chat.Completions.ChatCompletionCreateParamsNonStreaming = {
 				model: this.getModel().id.split("/")[1],
 				messages: [{ role: "user", content: prompt }],
-				temperature: this.options.modelTemperature ?? 0,
+			}
+
+			if (this.supportsTemperature()) {
+				requestOptions.temperature = this.options.modelTemperature ?? 0
 			}
 
 			if (this.getModel().id.startsWith("anthropic/")) {
-				requestOptions.max_tokens = 8192
+				requestOptions.max_tokens = this.getModel().info.maxTokens
 			}
 
-			const response = await this.client.chat.completions.create(requestOptions)
+			const response = await this.client.chat.completions.create(requestOptions, {
+				headers: {
+					"X-Unbound-Metadata": JSON.stringify({
+						labels: [
+							{
+								key: "app",
+								value: "roo-code",
+							},
+						],
+					}),
+				},
+			})
 			return response.choices[0]?.message.content || ""
 		} catch (error) {
 			if (error instanceof Error) {
@@ -162,4 +186,47 @@ export class UnboundHandler implements ApiHandler, SingleCompletionHandler {
 			throw error
 		}
 	}
+}
+
+export async function getUnboundModels() {
+	const models: Record<string, ModelInfo> = {}
+
+	try {
+		const response = await axios.get("https://api.getunbound.ai/models")
+
+		if (response.data) {
+			const rawModels: Record<string, any> = response.data
+
+			for (const [modelId, model] of Object.entries(rawModels)) {
+				const modelInfo: ModelInfo = {
+					maxTokens: model?.maxTokens ? parseInt(model.maxTokens) : undefined,
+					contextWindow: model?.contextWindow ? parseInt(model.contextWindow) : 0,
+					supportsImages: model?.supportsImages ?? false,
+					supportsPromptCache: model?.supportsPromptCaching ?? false,
+					supportsComputerUse: model?.supportsComputerUse ?? false,
+					inputPrice: model?.inputTokenPrice ? parseFloat(model.inputTokenPrice) : undefined,
+					outputPrice: model?.outputTokenPrice ? parseFloat(model.outputTokenPrice) : undefined,
+					cacheWritesPrice: model?.cacheWritePrice ? parseFloat(model.cacheWritePrice) : undefined,
+					cacheReadsPrice: model?.cacheReadPrice ? parseFloat(model.cacheReadPrice) : undefined,
+				}
+
+				switch (true) {
+					case modelId.startsWith("anthropic/"):
+						// Set max tokens to 8192 for supported Anthropic models
+						if (modelInfo.maxTokens !== 4096) {
+							modelInfo.maxTokens = 8192
+						}
+						break
+					default:
+						break
+				}
+
+				models[modelId] = modelInfo
+			}
+		}
+	} catch (error) {
+		console.error(`Error fetching Unbound models: ${JSON.stringify(error, Object.getOwnPropertyNames(error), 2)}`)
+	}
+
+	return models
 }

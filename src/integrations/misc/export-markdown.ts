@@ -15,7 +15,7 @@ export async function downloadTask(dateTs: number, conversationHistory: Anthropi
 	const ampm = hours >= 12 ? "pm" : "am"
 	hours = hours % 12
 	hours = hours ? hours : 12 // the hour '0' should be '12'
-	const fileName = `cline_task_${month}-${day}-${year}_${hours}-${minutes}-${seconds}-${ampm}.md`
+	const fileName = `roo_task_${month}-${day}-${year}_${hours}-${minutes}-${seconds}-${ampm}.md`
 
 	// Generate markdown
 	const markdownContent = conversationHistory
@@ -41,14 +41,7 @@ export async function downloadTask(dateTs: number, conversationHistory: Anthropi
 	}
 }
 
-export function formatContentBlockToMarkdown(
-	block:
-		| Anthropic.TextBlockParam
-		| Anthropic.ImageBlockParam
-		| Anthropic.ToolUseBlockParam
-		| Anthropic.ToolResultBlockParam,
-	// messages: Anthropic.MessageParam[]
-): string {
+export function formatContentBlockToMarkdown(block: Anthropic.Messages.ContentBlockParam): string {
 	switch (block.type) {
 		case "text":
 			return block.text

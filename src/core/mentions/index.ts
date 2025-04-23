@@ -9,13 +9,15 @@ import { isBinaryFile } from "isbinaryfile"
 import { diagnosticsToProblemsString } from "../../integrations/diagnostics"
 import { getCommitInfo, getWorkingState } from "../../utils/git"
 import { getLatestTerminalOutput } from "../../integrations/terminal/get-latest-output"
+import { getWorkspacePath } from "../../utils/path"
+import { FileContextTracker } from "../context-tracking/FileContextTracker"
 
 export async function openMention(mention?: string): Promise<void> {
 	if (!mention) {
 		return
 	}
 
-	const cwd = vscode.workspace.workspaceFolders?.map((folder) => folder.uri.fsPath).at(0)
+	const cwd = getWorkspacePath()
 	if (!cwd) {
 		return
 	}
@@ -37,7 +39,12 @@ export async function openMention(mention?: string): Promise<void> {
 	}
 }
 
-export async function parseMentions(text: string, cwd: string, urlContentFetcher: UrlContentFetcher): Promise<string> {
+export async function parseMentions(
+	text: string,
+	cwd: string,
+	urlContentFetcher: UrlContentFetcher,
+	fileContextTracker?: FileContextTracker,
+): Promise<string> {
 	const mentions: Set<string> = new Set()
 	let parsedText = text.replace(mentionRegexGlobal, (match, mention) => {
 		mentions.add(mention)
@@ -94,6 +101,10 @@ export async function parseMentions(text: string, cwd: string, urlContentFetcher
 					parsedText += `\n\n<folder_content path="${mentionPath}">\n${content}\n</folder_content>`
 				} else {
 					parsedText += `\n\n<file_content path="${mentionPath}">\n${content}\n</file_content>`
+					// Track that this file was mentioned and its content was included
+					if (fileContextTracker) {
+						await fileContextTracker.trackFileContext(mentionPath, "file_mentioned")
+					}
 				}
 			} catch (error) {
 				if (mention.endsWith("/")) {
@@ -104,7 +115,7 @@ export async function parseMentions(text: string, cwd: string, urlContentFetcher
 			}
 		} else if (mention === "problems") {
 			try {
-				const problems = getWorkspaceProblems(cwd)
+				const problems = await getWorkspaceProblems(cwd)
 				parsedText += `\n\n<workspace_diagnostics>\n${problems}\n</workspace_diagnostics>`
 			} catch (error) {
 				parsedText += `\n\n<workspace_diagnostics>\nError fetching diagnostics: ${error.message}\n</workspace_diagnostics>`
@@ -151,12 +162,12 @@ async function getFileOrFolderContent(mentionPath: string, cwd: string): Promise
 		const stats = await fs.stat(absPath)
 
 		if (stats.isFile()) {
-			const isBinary = await isBinaryFile(absPath).catch(() => false)
-			if (isBinary) {
-				return "(Binary file, unable to display content)"
+			try {
+				const content = await extractTextFromFile(absPath)
+				return content
+			} catch (error) {
+				return `(Failed to read contents of ${mentionPath}): ${error.message}`
 			}
-			const content = await extractTextFromFile(absPath)
-			return content
 		} else if (stats.isDirectory()) {
 			const entries = await fs.readdir(absPath, { withFileTypes: true })
 			let folderContent = ""
@@ -198,9 +209,9 @@ async function getFileOrFolderContent(mentionPath: string, cwd: string): Promise
 	}
 }
 
-function getWorkspaceProblems(cwd: string): string {
+async function getWorkspaceProblems(cwd: string): Promise<string> {
 	const diagnostics = vscode.languages.getDiagnostics()
-	const result = diagnosticsToProblemsString(
+	const result = await diagnosticsToProblemsString(
 		diagnostics,
 		[vscode.DiagnosticSeverity.Error, vscode.DiagnosticSeverity.Warning],
 		cwd,

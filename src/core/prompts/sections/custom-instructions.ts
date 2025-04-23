@@ -1,25 +1,181 @@
 import fs from "fs/promises"
 import path from "path"
 
-export async function loadRuleFiles(cwd: string): Promise<string> {
-	const ruleFiles = [".clinerules", ".cursorrules", ".windsurfrules"]
-	let combinedRules = ""
+import { LANGUAGES, isLanguage } from "../../../shared/language"
+import { Dirent } from "fs"
 
-	for (const file of ruleFiles) {
-		try {
-			const content = await fs.readFile(path.join(cwd, file), "utf-8")
-			if (content.trim()) {
-				combinedRules += `\n# Rules from ${file}:\n${content.trim()}\n`
+/**
+ * Safely read a file and return its trimmed content
+ */
+async function safeReadFile(filePath: string): Promise<string> {
+	try {
+		const content = await fs.readFile(filePath, "utf-8")
+		return content.trim()
+	} catch (err) {
+		const errorCode = (err as NodeJS.ErrnoException).code
+		if (!errorCode || !["ENOENT", "EISDIR"].includes(errorCode)) {
+			throw err
+		}
+		return ""
+	}
+}
+
+/**
+ * Check if a directory exists
+ */
+async function directoryExists(dirPath: string): Promise<boolean> {
+	try {
+		const stats = await fs.stat(dirPath)
+		return stats.isDirectory()
+	} catch (err) {
+		return false
+	}
+}
+
+const MAX_DEPTH = 5
+
+/**
+ * Recursively resolve directory entries and collect file paths
+ */
+async function resolveDirectoryEntry(
+	entry: Dirent,
+	dirPath: string,
+	filePaths: string[],
+	depth: number,
+): Promise<void> {
+	// Avoid cyclic symlinks
+	if (depth > MAX_DEPTH) {
+		return
+	}
+
+	const fullPath = path.resolve(entry.parentPath || dirPath, entry.name)
+	if (entry.isFile()) {
+		// Regular file
+		filePaths.push(fullPath)
+	} else if (entry.isSymbolicLink()) {
+		// Await the resolution of the symbolic link
+		await resolveSymLink(fullPath, filePaths, depth + 1)
+	}
+}
+
+/**
+ * Recursively resolve a symbolic link and collect file paths
+ */
+async function resolveSymLink(fullPath: string, filePaths: string[], depth: number): Promise<void> {
+	// Avoid cyclic symlinks
+	if (depth > MAX_DEPTH) {
+		return
+	}
+	try {
+		// Get the symlink target
+		const linkTarget = await fs.readlink(fullPath)
+		// Resolve the target path (relative to the symlink location)
+		const resolvedTarget = path.resolve(path.dirname(fullPath), linkTarget)
+
+		// Check if the target is a file
+		const stats = await fs.stat(resolvedTarget)
+		if (stats.isFile()) {
+			filePaths.push(resolvedTarget)
+		} else if (stats.isDirectory()) {
+			const anotherEntries = await fs.readdir(resolvedTarget, { withFileTypes: true, recursive: true })
+			// Collect promises for recursive calls within the directory
+			const directoryPromises: Promise<void>[] = []
+			for (const anotherEntry of anotherEntries) {
+				directoryPromises.push(resolveDirectoryEntry(anotherEntry, resolvedTarget, filePaths, depth + 1))
 			}
-		} catch (err) {
-			// Silently skip if file doesn't exist
-			if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
-				throw err
-			}
+			// Wait for all entries in the resolved directory to be processed
+			await Promise.all(directoryPromises)
+		} else if (stats.isSymbolicLink()) {
+			// Handle nested symlinks by awaiting the recursive call
+			await resolveSymLink(resolvedTarget, filePaths, depth + 1)
+		}
+	} catch (err) {
+		// Skip invalid symlinks
+	}
+}
+
+/**
+ * Read all text files from a directory in alphabetical order
+ */
+async function readTextFilesFromDirectory(dirPath: string): Promise<Array<{ filename: string; content: string }>> {
+	try {
+		const entries = await fs.readdir(dirPath, { withFileTypes: true, recursive: true })
+
+		// Process all entries - regular files and symlinks that might point to files
+		const filePaths: string[] = []
+		// Collect promises for the initial resolution calls
+		const initialPromises: Promise<void>[] = []
+
+		for (const entry of entries) {
+			initialPromises.push(resolveDirectoryEntry(entry, dirPath, filePaths, 0))
+		}
+
+		// Wait for all asynchronous operations (including recursive ones) to complete
+		await Promise.all(initialPromises)
+
+		const fileContents = await Promise.all(
+			filePaths.map(async (file) => {
+				try {
+					// Check if it's a file (not a directory)
+					const stats = await fs.stat(file)
+					if (stats.isFile()) {
+						const content = await safeReadFile(file)
+						return { filename: file, content }
+					}
+					return null
+				} catch (err) {
+					return null
+				}
+			}),
+		)
+
+		// Filter out null values (directories or failed reads)
+		return fileContents.filter((item): item is { filename: string; content: string } => item !== null)
+	} catch (err) {
+		return []
+	}
+}
+
+/**
+ * Format content from multiple files with filenames as headers
+ */
+function formatDirectoryContent(dirPath: string, files: Array<{ filename: string; content: string }>): string {
+	if (files.length === 0) return ""
+
+	return (
+		"\n\n" +
+		files
+			.map((file) => {
+				return `# Rules from ${file.filename}:\n${file.content}`
+			})
+			.join("\n\n")
+	)
+}
+
+/**
+ * Load rule files from the specified directory
+ */
+export async function loadRuleFiles(cwd: string): Promise<string> {
+	// Check for .roo/rules/ directory
+	const rooRulesDir = path.join(cwd, ".roo", "rules")
+	if (await directoryExists(rooRulesDir)) {
+		const files = await readTextFilesFromDirectory(rooRulesDir)
+		if (files.length > 0) {
+			return formatDirectoryContent(rooRulesDir, files)
 		}
 	}
 
-	return combinedRules
+	// Fall back to existing behavior
+	const ruleFiles = [".roorules", ".clinerules"]
+
+	for (const file of ruleFiles) {
+		const content = await safeReadFile(path.join(cwd, file))
+		if (content) {
+			return `\n# Rules from ${file}:\n${content}\n`
+		}
+	}
+
+	return ""
 }
 
 export async function addCustomInstructions(
@@ -27,31 +183,46 @@ export async function addCustomInstructions(
 	globalCustomInstructions: string,
 	cwd: string,
 	mode: string,
-	options: { preferredLanguage?: string } = {},
+	options: { language?: string; rooIgnoreInstructions?: string } = {},
 ): Promise<string> {
 	const sections = []
 
 	// Load mode-specific rules if mode is provided
 	let modeRuleContent = ""
+	let usedRuleFile = ""
+
 	if (mode) {
-		try {
-			const modeRuleFile = `.clinerules-${mode}`
-			const content = await fs.readFile(path.join(cwd, modeRuleFile), "utf-8")
-			if (content.trim()) {
-				modeRuleContent = content.trim()
+		// Check for .roo/rules-${mode}/ directory
+		const modeRulesDir = path.join(cwd, ".roo", `rules-${mode}`)
+		if (await directoryExists(modeRulesDir)) {
+			const files = await readTextFilesFromDirectory(modeRulesDir)
+			if (files.length > 0) {
+				modeRuleContent = formatDirectoryContent(modeRulesDir, files)
+				usedRuleFile = modeRulesDir
 			}
-		} catch (err) {
-			// Silently skip if file doesn't exist
-			if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
-				throw err
+		}
+
+		// If no directory exists, fall back to existing behavior
+		if (!modeRuleContent) {
+			const rooModeRuleFile = `.roorules-${mode}`
+			modeRuleContent = await safeReadFile(path.join(cwd, rooModeRuleFile))
+			if (modeRuleContent) {
+				usedRuleFile = rooModeRuleFile
+			} else {
+				const clineModeRuleFile = `.clinerules-${mode}`
+				modeRuleContent = await safeReadFile(path.join(cwd, clineModeRuleFile))
+				if (modeRuleContent) {
+					usedRuleFile = clineModeRuleFile
+				}
 			}
 		}
 	}
 
 	// Add language preference if provided
-	if (options.preferredLanguage) {
+	if (options.language) {
+		const languageName = isLanguage(options.language) ? LANGUAGES[options.language] : options.language
 		sections.push(
-			`Language Preference:\nYou should always speak and think in the ${options.preferredLanguage} language.`,
+			`Language Preference:\nYou should always speak and think in the "${languageName}" (${options.language}) language unless the user gives you instructions below to do otherwise.`,
 		)
 	}
 
@@ -70,8 +241,15 @@ export async function addCustomInstructions(
 
 	// Add mode-specific rules first if they exist
 	if (modeRuleContent && modeRuleContent.trim()) {
-		const modeRuleFile = `.clinerules-${mode}`
-		rules.push(`# Rules from ${modeRuleFile}:\n${modeRuleContent}`)
+		if (usedRuleFile.includes(path.join(".roo", `rules-${mode}`))) {
+			rules.push(modeRuleContent.trim())
+		} else {
+			rules.push(`# Rules from ${usedRuleFile}:\n${modeRuleContent}`)
+		}
+	}
+
+	if (options.rooIgnoreInstructions) {
+		rules.push(options.rooIgnoreInstructions)
 	}
 
 	// Add generic rules

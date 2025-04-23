@@ -1,6 +1,6 @@
-import { VSCodeButton } from "@vscode/webview-ui-toolkit/react"
+import { VSCodeButton, VSCodeLink } from "@vscode/webview-ui-toolkit/react"
 import debounce from "debounce"
-import { useCallback, useEffect, useMemo, useRef, useState } from "react"
+import { forwardRef, useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState } from "react"
 import { useDeepCompareEffect, useEvent, useMount } from "react-use"
 import { Virtuoso, type VirtuosoHandle } from "react-virtuoso"
 import styled from "styled-components"
@@ -10,15 +10,16 @@ import {
 	ClineSayBrowserAction,
 	ClineSayTool,
 	ExtensionMessage,
-} from "../../../../src/shared/ExtensionMessage"
-import { McpServer, McpTool } from "../../../../src/shared/mcp"
-import { findLast } from "../../../../src/shared/array"
-import { combineApiRequests } from "../../../../src/shared/combineApiRequests"
-import { combineCommandSequences } from "../../../../src/shared/combineCommandSequences"
-import { getApiMetrics } from "../../../../src/shared/getApiMetrics"
-import { useExtensionState } from "../../context/ExtensionStateContext"
-import { vscode } from "../../utils/vscode"
+} from "@roo/shared/ExtensionMessage"
+import { McpServer, McpTool } from "@roo/shared/mcp"
+import { findLast } from "@roo/shared/array"
+import { combineApiRequests } from "@roo/shared/combineApiRequests"
+import { combineCommandSequences } from "@roo/shared/combineCommandSequences"
+import { getApiMetrics } from "@roo/shared/getApiMetrics"
+import { useExtensionState } from "@src/context/ExtensionStateContext"
+import { vscode } from "@src/utils/vscode"
 import HistoryPreview from "../history/HistoryPreview"
+import RooHero from "../welcome/RooHero"
 import { normalizeApiConfiguration } from "../settings/ApiOptions"
 import Announcement from "./Announcement"
 import BrowserSessionRow from "./BrowserSessionRow"
@@ -26,9 +27,14 @@ import ChatRow from "./ChatRow"
 import ChatTextArea from "./ChatTextArea"
 import TaskHeader from "./TaskHeader"
 import AutoApproveMenu from "./AutoApproveMenu"
-import { AudioType } from "../../../../src/shared/WebviewMessage"
-import { validateCommand } from "../../utils/command-validation"
-
+import SystemPromptWarning from "./SystemPromptWarning"
+import { AudioType } from "@roo/shared/WebviewMessage"
+import { validateCommand } from "@src/utils/command-validation"
+import { getAllModes } from "@roo/shared/modes"
+import TelemetryBanner from "../common/TelemetryBanner"
+import { useAppTranslation } from "@/i18n/TranslationContext"
+import removeMd from "remove-markdown"
+import { Trans } from "react-i18next"
 interface ChatViewProps {
 	isHidden: boolean
 	showAnnouncement: boolean
@@ -36,9 +42,20 @@ interface ChatViewProps {
 	showHistoryView: () => void
 }
 
+export interface ChatViewRef {
+	acceptInput: () => void
+}
+
 export const MAX_IMAGES_PER_MESSAGE = 20 // Anthropic limits to 20 images
 
-const ChatView = ({ isHidden, showAnnouncement, hideAnnouncement, showHistoryView }: ChatViewProps) => {
+const isMac = navigator.platform.toUpperCase().indexOf("MAC") >= 0
+
+const ChatViewComponent: React.ForwardRefRenderFunction<ChatViewRef, ChatViewProps> = (
+	{ isHidden, showAnnouncement, hideAnnouncement, showHistoryView },
+	ref,
+) => {
+	const { t } = useAppTranslation()
+	const modeShortcutText = `${isMac ? "⌘" : "Ctrl"} + . ${t("chat:forNextMode")}`
 	const {
 		version,
 		clineMessages: messages,
@@ -47,7 +64,9 @@ const ChatView = ({ isHidden, showAnnouncement, hideAnnouncement, showHistoryVie
 		mcpServers,
 		alwaysAllowBrowser,
 		alwaysAllowReadOnly,
+		alwaysAllowReadOnlyOutsideWorkspace,
 		alwaysAllowWrite,
+		alwaysAllowWriteOutsideWorkspace,
 		alwaysAllowExecute,
 		alwaysAllowMcp,
 		allowedCommands,
@@ -56,6 +75,10 @@ const ChatView = ({ isHidden, showAnnouncement, hideAnnouncement, showHistoryVie
 		setMode,
 		autoApprovalEnabled,
 		alwaysAllowModeSwitch,
+		alwaysAllowSubtasks,
+		customModes,
+		telemetrySetting,
+		hasSystemPromptOverride,
 	} = useExtensionState()
 
 	//const task = messages.length > 0 ? (messages[0].say === "task" ? messages[0] : undefined) : undefined) : undefined
@@ -81,8 +104,9 @@ const ChatView = ({ isHidden, showAnnouncement, hideAnnouncement, showHistoryVie
 	const disableAutoScrollRef = useRef(false)
 	const [showScrollToBottom, setShowScrollToBottom] = useState(false)
 	const [isAtBottom, setIsAtBottom] = useState(false)
-
+	const lastTtsRef = useRef<string>("")
 	const [wasStreaming, setWasStreaming] = useState<boolean>(false)
+	const [showCheckpointWarning, setShowCheckpointWarning] = useState<boolean>(false)
 
 	// UI layout depends on the last 2 messages
 	// (since it relies on the content of these messages, we are deep comparing. i.e. the button state after hitting button sets enableButtons to false, and this effect otherwise would have to true again even if messages didn't change
@@ -91,6 +115,10 @@ const ChatView = ({ isHidden, showAnnouncement, hideAnnouncement, showHistoryVie
 
 	function playSound(audioType: AudioType) {
 		vscode.postMessage({ type: "playSound", audioType })
+	}
+
+	function playTts(text: string) {
+		vscode.postMessage({ type: "playTts", text })
 	}
 
 	useDeepCompareEffect(() => {
@@ -107,23 +135,27 @@ const ChatView = ({ isHidden, showAnnouncement, hideAnnouncement, showHistoryVie
 							setTextAreaDisabled(true)
 							setClineAsk("api_req_failed")
 							setEnableButtons(true)
-							setPrimaryButtonText("Retry")
-							setSecondaryButtonText("Start New Task")
+							setPrimaryButtonText(t("chat:retry.title"))
+							setSecondaryButtonText(t("chat:startNewTask.title"))
 							break
 						case "mistake_limit_reached":
 							playSound("progress_loop")
 							setTextAreaDisabled(false)
 							setClineAsk("mistake_limit_reached")
 							setEnableButtons(true)
-							setPrimaryButtonText("Proceed Anyways")
-							setSecondaryButtonText("Start New Task")
+							setPrimaryButtonText(t("chat:proceedAnyways.title"))
+							setSecondaryButtonText(t("chat:startNewTask.title"))
 							break
 						case "followup":
 							setTextAreaDisabled(isPartial)
 							setClineAsk("followup")
-							setEnableButtons(isPartial)
-							// setPrimaryButtonText(undefined)
-							// setSecondaryButtonText(undefined)
+							// setting enable buttons to `false` would trigger a focus grab when
+							// the text area is enabled which is undesirable.
+							// We have no buttons for this tool, so no problem having them "enabled"
+							// to workaround this issue.  See #1358.
+							setEnableButtons(true)
+							setPrimaryButtonText(undefined)
+							setSecondaryButtonText(undefined)
 							break
 						case "tool":
 							if (!isAutoApproved(lastMessage)) {
@@ -137,12 +169,17 @@ const ChatView = ({ isHidden, showAnnouncement, hideAnnouncement, showHistoryVie
 								case "editedExistingFile":
 								case "appliedDiff":
 								case "newFileCreated":
-									setPrimaryButtonText("Save")
-									setSecondaryButtonText("Reject")
+								case "insertContent":
+									setPrimaryButtonText(t("chat:save.title"))
+									setSecondaryButtonText(t("chat:reject.title"))
+									break
+								case "finishTask":
+									setPrimaryButtonText(t("chat:completeSubtaskAndReturn"))
+									setSecondaryButtonText(undefined)
 									break
 								default:
-									setPrimaryButtonText("Approve")
-									setSecondaryButtonText("Reject")
+									setPrimaryButtonText(t("chat:approve.title"))
+									setSecondaryButtonText(t("chat:reject.title"))
 									break
 							}
 							break
@@ -153,8 +190,8 @@ const ChatView = ({ isHidden, showAnnouncement, hideAnnouncement, showHistoryVie
 							setTextAreaDisabled(isPartial)
 							setClineAsk("browser_action_launch")
 							setEnableButtons(!isPartial)
-							setPrimaryButtonText("Approve")
-							setSecondaryButtonText("Reject")
+							setPrimaryButtonText(t("chat:approve.title"))
+							setSecondaryButtonText(t("chat:reject.title"))
 							break
 						case "command":
 							if (!isAutoApproved(lastMessage)) {
@@ -163,22 +200,22 @@ const ChatView = ({ isHidden, showAnnouncement, hideAnnouncement, showHistoryVie
 							setTextAreaDisabled(isPartial)
 							setClineAsk("command")
 							setEnableButtons(!isPartial)
-							setPrimaryButtonText("Run Command")
-							setSecondaryButtonText("Reject")
+							setPrimaryButtonText(t("chat:runCommand.title"))
+							setSecondaryButtonText(t("chat:reject.title"))
 							break
 						case "command_output":
 							setTextAreaDisabled(false)
 							setClineAsk("command_output")
 							setEnableButtons(true)
-							setPrimaryButtonText("Proceed While Running")
+							setPrimaryButtonText(t("chat:proceedWhileRunning.title"))
 							setSecondaryButtonText(undefined)
 							break
 						case "use_mcp_server":
 							setTextAreaDisabled(isPartial)
 							setClineAsk("use_mcp_server")
 							setEnableButtons(!isPartial)
-							setPrimaryButtonText("Approve")
-							setSecondaryButtonText("Reject")
+							setPrimaryButtonText(t("chat:approve.title"))
+							setSecondaryButtonText(t("chat:reject.title"))
 							break
 						case "completion_result":
 							// extension waiting for feedback. but we can just present a new task button
@@ -186,22 +223,22 @@ const ChatView = ({ isHidden, showAnnouncement, hideAnnouncement, showHistoryVie
 							setTextAreaDisabled(isPartial)
 							setClineAsk("completion_result")
 							setEnableButtons(!isPartial)
-							setPrimaryButtonText("Start New Task")
+							setPrimaryButtonText(t("chat:startNewTask.title"))
 							setSecondaryButtonText(undefined)
 							break
 						case "resume_task":
 							setTextAreaDisabled(false)
 							setClineAsk("resume_task")
 							setEnableButtons(true)
-							setPrimaryButtonText("Resume Task")
-							setSecondaryButtonText("Terminate")
+							setPrimaryButtonText(t("chat:resumeTask.title"))
+							setSecondaryButtonText(t("chat:terminate.title"))
 							setDidClickCancel(false) // special case where we reset the cancel button state
 							break
 						case "resume_completed_task":
 							setTextAreaDisabled(false)
 							setClineAsk("resume_completed_task")
 							setEnableButtons(true)
-							setPrimaryButtonText("Start New Task")
+							setPrimaryButtonText(t("chat:startNewTask.title"))
 							setSecondaryButtonText(undefined)
 							setDidClickCancel(false)
 							break
@@ -292,6 +329,19 @@ const ChatView = ({ isHidden, showAnnouncement, hideAnnouncement, showHistoryVie
 		return false
 	}, [modifiedMessages, clineAsk, enableButtons, primaryButtonText])
 
+	const handleChatReset = useCallback(() => {
+		// Only reset message-specific state, preserving mode.
+		setInputValue("")
+		setTextAreaDisabled(true)
+		setSelectedImages([])
+		setClineAsk(undefined)
+		setEnableButtons(false)
+		// Do not reset mode here as it should persist.
+		// setPrimaryButtonText(undefined)
+		// setSecondaryButtonText(undefined)
+		disableAutoScrollRef.current = false
+	}, [])
+
 	const handleSendMessage = useCallback(
 		(text: string, images: string[]) => {
 			text = text.trim()
@@ -303,36 +353,22 @@ const ChatView = ({ isHidden, showAnnouncement, hideAnnouncement, showHistoryVie
 						case "followup":
 						case "tool":
 						case "browser_action_launch":
-						case "command": // user can provide feedback to a tool or command use
-						case "command_output": // user can send input to command stdin
+						case "command": // User can provide feedback to a tool or command use.
+						case "command_output": // User can send input to command stdin.
 						case "use_mcp_server":
-						case "completion_result": // if this happens then the user has feedback for the completion result
+						case "completion_result": // If this happens then the user has feedback for the completion result.
 						case "resume_task":
 						case "resume_completed_task":
 						case "mistake_limit_reached":
-							vscode.postMessage({
-								type: "askResponse",
-								askResponse: "messageResponse",
-								text,
-								images,
-							})
+							vscode.postMessage({ type: "askResponse", askResponse: "messageResponse", text, images })
 							break
-						// there is no other case that a textfield should be enabled
+						// There is no other case that a textfield should be enabled.
 					}
 				}
-				// Only reset message-specific state, preserving mode
-				setInputValue("")
-				setTextAreaDisabled(true)
-				setSelectedImages([])
-				setClineAsk(undefined)
-				setEnableButtons(false)
-				// Do not reset mode here as it should persist
-				// setPrimaryButtonText(undefined)
-				// setSecondaryButtonText(undefined)
-				disableAutoScrollRef.current = false
+				handleChatReset()
 			}
 		},
-		[messages.length, clineAsk],
+		[messages.length, clineAsk, handleChatReset],
 	)
 
 	const handleSetChatBoxMessage = useCallback(
@@ -395,7 +431,6 @@ const ChatView = ({ isHidden, showAnnouncement, hideAnnouncement, showHistoryVie
 			setTextAreaDisabled(true)
 			setClineAsk(undefined)
 			setEnableButtons(false)
-			disableAutoScrollRef.current = false
 		},
 		[clineAsk, startNewTask],
 	)
@@ -442,7 +477,6 @@ const ChatView = ({ isHidden, showAnnouncement, hideAnnouncement, showHistoryVie
 			setTextAreaDisabled(true)
 			setClineAsk(undefined)
 			setEnableButtons(false)
-			disableAutoScrollRef.current = false
 		},
 		[clineAsk, startNewTask, isStreaming],
 	)
@@ -473,6 +507,9 @@ const ChatView = ({ isHidden, showAnnouncement, hideAnnouncement, showHistoryVie
 								textAreaRef.current?.focus()
 							}
 							break
+						case "focusInput":
+							textAreaRef.current?.focus()
+							break
 					}
 					break
 				case "selectedImages":
@@ -485,6 +522,9 @@ const ChatView = ({ isHidden, showAnnouncement, hideAnnouncement, showHistoryVie
 					break
 				case "invoke":
 					switch (message.invoke!) {
+						case "newChat":
+							handleChatReset()
+							break
 						case "sendMessage":
 							handleSendMessage(message.text ?? "", message.images ?? [])
 							break
@@ -505,6 +545,7 @@ const ChatView = ({ isHidden, showAnnouncement, hideAnnouncement, showHistoryVie
 			isHidden,
 			textAreaDisabled,
 			enableButtons,
+			handleChatReset,
 			handleSendMessage,
 			handleSetChatBoxMessage,
 			handlePrimaryButtonClick,
@@ -550,8 +591,13 @@ const ChatView = ({ isHidden, showAnnouncement, hideAnnouncement, showHistoryVie
 				case "api_req_deleted": // aggregated api_req metrics from deleted messages
 					return false
 				case "api_req_retry_delayed":
-					// Only show the retry message if it's the last message
-					return message === modifiedMessages.at(-1)
+					// Only show the retry message if it's the last message or the last messages is api_req_retry_delayed+resume_task
+					const last1 = modifiedMessages.at(-1)
+					const last2 = modifiedMessages.at(-2)
+					if (last1?.ask === "resume_task" && last2 === message) {
+						return true
+					}
+					return message === last1
 				case "text":
 					// Sometimes cline returns an empty text message, we don't want to render these. (We also use a say text for user messages, so in case they just sent images we still render that)
 					if ((message.text ?? "") === "" && (message.images?.length ?? 0) === 0) {
@@ -589,7 +635,13 @@ const ChatView = ({ isHidden, showAnnouncement, hideAnnouncement, showHistoryVie
 				return true
 			}
 			const tool = JSON.parse(message.text)
-			return ["editedExistingFile", "appliedDiff", "newFileCreated"].includes(tool.tool)
+			return [
+				"editedExistingFile",
+				"appliedDiff",
+				"newFileCreated",
+				"searchAndReplace",
+				"insertContent",
+			].includes(tool.tool)
 		}
 		return false
 	}, [])
@@ -625,34 +677,108 @@ const ChatView = ({ isHidden, showAnnouncement, hideAnnouncement, showHistoryVie
 		(message: ClineMessage | undefined) => {
 			if (!autoApprovalEnabled || !message || message.type !== "ask") return false
 
-			return (
-				(alwaysAllowBrowser && message.ask === "browser_action_launch") ||
-				(alwaysAllowReadOnly && message.ask === "tool" && isReadOnlyToolAction(message)) ||
-				(alwaysAllowWrite && message.ask === "tool" && isWriteToolAction(message)) ||
-				(alwaysAllowExecute && message.ask === "command" && isAllowedCommand(message)) ||
-				(alwaysAllowMcp && message.ask === "use_mcp_server" && isMcpToolAlwaysAllowed(message)) ||
-				(alwaysAllowModeSwitch &&
-					message.ask === "tool" &&
-					(JSON.parse(message.text || "{}")?.tool === "switchMode" ||
-						JSON.parse(message.text || "{}")?.tool === "newTask"))
-			)
+			if (message.ask === "browser_action_launch") {
+				return alwaysAllowBrowser
+			}
+
+			if (message.ask === "use_mcp_server") {
+				return alwaysAllowMcp && isMcpToolAlwaysAllowed(message)
+			}
+
+			if (message.ask === "command") {
+				return alwaysAllowExecute && isAllowedCommand(message)
+			}
+
+			// For read/write operations, check if it's outside workspace and if we have permission for that
+			if (message.ask === "tool") {
+				let tool: any = {}
+				try {
+					tool = JSON.parse(message.text || "{}")
+				} catch (error) {
+					console.error("Failed to parse tool:", error)
+				}
+
+				if (!tool) {
+					return false
+				}
+
+				if (tool?.tool === "fetchInstructions") {
+					if (tool.content === "create_mode") {
+						return alwaysAllowModeSwitch
+					}
+					if (tool.content === "create_mcp_server") {
+						return alwaysAllowMcp
+					}
+				}
+
+				if (tool?.tool === "switchMode") {
+					return alwaysAllowModeSwitch
+				}
+
+				if (["newTask", "finishTask"].includes(tool?.tool)) {
+					return alwaysAllowSubtasks
+				}
+
+				const isOutsideWorkspace = !!tool.isOutsideWorkspace
+
+				if (isReadOnlyToolAction(message)) {
+					return alwaysAllowReadOnly && (!isOutsideWorkspace || alwaysAllowReadOnlyOutsideWorkspace)
+				}
+
+				if (isWriteToolAction(message)) {
+					return alwaysAllowWrite && (!isOutsideWorkspace || alwaysAllowWriteOutsideWorkspace)
+				}
+			}
+
+			return false
 		},
 		[
 			autoApprovalEnabled,
 			alwaysAllowBrowser,
 			alwaysAllowReadOnly,
+			alwaysAllowReadOnlyOutsideWorkspace,
 			isReadOnlyToolAction,
 			alwaysAllowWrite,
+			alwaysAllowWriteOutsideWorkspace,
 			isWriteToolAction,
 			alwaysAllowExecute,
 			isAllowedCommand,
 			alwaysAllowMcp,
 			isMcpToolAlwaysAllowed,
 			alwaysAllowModeSwitch,
+			alwaysAllowSubtasks,
 		],
 	)
 
 	useEffect(() => {
+		// this ensures the first message is not read, future user messages are labelled as user_feedback
+		if (lastMessage && messages.length > 1) {
+			//console.log(JSON.stringify(lastMessage))
+			if (
+				lastMessage.text && // has text
+				(lastMessage.say === "text" || lastMessage.say === "completion_result") && // is a text message
+				!lastMessage.partial && // not a partial message
+				!lastMessage.text.startsWith("{") // not a json object
+			) {
+				let text = lastMessage?.text || ""
+				const mermaidRegex = /```mermaid[\s\S]*?```/g
+				// remove mermaid diagrams from text
+				text = text.replace(mermaidRegex, "")
+				// remove markdown from text
+				text = removeMd(text)
+
+				// ensure message is not a duplicate of last read message
+				if (text !== lastTtsRef.current) {
+					try {
+						playTts(text)
+						lastTtsRef.current = text
+					} catch (error) {
+						console.error("Failed to execute text-to-speech:", error)
+					}
+				}
+			}
+		}
+
 		// Only execute when isStreaming changes from true to false
 		if (wasStreaming && !isStreaming && lastMessage) {
 			// Play appropriate sound based on lastMessage content
@@ -685,7 +811,7 @@ const ChatView = ({ isHidden, showAnnouncement, hideAnnouncement, showHistoryVie
 		}
 		// Update previous value
 		setWasStreaming(isStreaming)
-	}, [isStreaming, lastMessage, wasStreaming, isAutoApproved])
+	}, [isStreaming, lastMessage, wasStreaming, isAutoApproved, messages.length])
 
 	const isBrowserSessionMessage = (message: ClineMessage): boolean => {
 		// which of visible messages are browser session messages, see above
@@ -877,13 +1003,60 @@ const ChatView = ({ isHidden, showAnnouncement, hideAnnouncement, showHistoryVie
 	}, [])
 	useEvent("wheel", handleWheel, window, { passive: true }) // passive improves scrolling performance
 
-	const placeholderText = useMemo(() => {
-		const baseText = task ? "Type a message..." : "Type your task here..."
-		const contextText = "(@ to add context, / to switch modes"
-		const imageText = shouldDisableImages ? "" : ", hold shift to drag in images"
-		const helpText = imageText ? `\n${contextText}${imageText})` : `\n${contextText})`
-		return baseText + helpText
-	}, [task, shouldDisableImages])
+	// Effect to handle showing the checkpoint warning after a delay
+	useEffect(() => {
+		// Only show the warning when there's a task but no visible messages yet
+		if (task && modifiedMessages.length === 0 && !isStreaming) {
+			const timer = setTimeout(() => {
+				setShowCheckpointWarning(true)
+			}, 5000) // 5 seconds
+
+			return () => clearTimeout(timer)
+		}
+	}, [task, modifiedMessages.length, isStreaming])
+
+	// Effect to hide the checkpoint warning when messages appear
+	useEffect(() => {
+		if (modifiedMessages.length > 0 || isStreaming) {
+			setShowCheckpointWarning(false)
+		}
+	}, [modifiedMessages.length, isStreaming])
+
+	// Checkpoint warning component
+	const CheckpointWarningMessage = useCallback(
+		() => (
+			<div className="flex items-center p-3 my-3 bg-vscode-inputValidation-warningBackground border border-vscode-inputValidation-warningBorder rounded">
+				<span className="codicon codicon-loading codicon-modifier-spin mr-2" />
+				<span className="text-vscode-foreground">
+					<Trans
+						i18nKey="chat:checkpoint.initializingWarning"
+						components={{
+							settingsLink: (
+								<VSCodeLink
+									href="#"
+									onClick={(e) => {
+										e.preventDefault()
+										window.postMessage(
+											{
+												type: "action",
+												action: "settingsButtonClicked",
+												values: { section: "checkpoints" },
+											},
+											"*",
+										)
+									}}
+									className="inline px-0.5"
+								/>
+							),
+						}}
+					/>
+				</span>
+			</div>
+		),
+		[],
+	)
+
+	const placeholderText = task ? t("chat:typeMessage") : t("chat:typeTask")
 
 	const itemContent = useCallback(
 		(index: number, messageOrGroup: ClineMessage | ClineMessage[]) => {
@@ -919,6 +1092,16 @@ const ChatView = ({ isHidden, showAnnouncement, hideAnnouncement, showHistoryVie
 					isLast={index === groupedMessages.length - 1}
 					onHeightChange={handleRowHeightChange}
 					isStreaming={isStreaming}
+					onSuggestionClick={(answer: string, event?: React.MouseEvent) => {
+						if (event?.shiftKey) {
+							// Always append to existing text, don't overwrite
+							setInputValue((currentValue) => {
+								return currentValue !== "" ? `${currentValue} \n${answer}` : answer
+							})
+						} else {
+							handleSendMessage(answer, [])
+						}
+					}}
 				/>
 			)
 		},
@@ -929,6 +1112,7 @@ const ChatView = ({ isHidden, showAnnouncement, hideAnnouncement, showHistoryVie
 			handleRowHeightChange,
 			isStreaming,
 			toggleRowExpansion,
+			handleSendMessage,
 		],
 	)
 
@@ -952,7 +1136,9 @@ const ChatView = ({ isHidden, showAnnouncement, hideAnnouncement, showHistoryVie
 		handlePrimaryButtonClick,
 		alwaysAllowBrowser,
 		alwaysAllowReadOnly,
+		alwaysAllowReadOnlyOutsideWorkspace,
 		alwaysAllowWrite,
+		alwaysAllowWriteOutsideWorkspace,
 		alwaysAllowExecute,
 		alwaysAllowMcp,
 		messages,
@@ -963,6 +1149,49 @@ const ChatView = ({ isHidden, showAnnouncement, hideAnnouncement, showHistoryVie
 		writeDelayMs,
 		isWriteToolAction,
 	])
+
+	// Function to handle mode switching
+	const switchToNextMode = useCallback(() => {
+		const allModes = getAllModes(customModes)
+		const currentModeIndex = allModes.findIndex((m) => m.slug === mode)
+		const nextModeIndex = (currentModeIndex + 1) % allModes.length
+		// Update local state and notify extension to sync mode change
+		setMode(allModes[nextModeIndex].slug)
+		vscode.postMessage({
+			type: "mode",
+			text: allModes[nextModeIndex].slug,
+		})
+	}, [mode, setMode, customModes])
+
+	// Add keyboard event handler
+	const handleKeyDown = useCallback(
+		(event: KeyboardEvent) => {
+			// Check for Command + . (period)
+			if ((event.metaKey || event.ctrlKey) && event.key === ".") {
+				event.preventDefault() // Prevent default browser behavior
+				switchToNextMode()
+			}
+		},
+		[switchToNextMode],
+	)
+
+	// Add event listener
+	useEffect(() => {
+		window.addEventListener("keydown", handleKeyDown)
+		return () => {
+			window.removeEventListener("keydown", handleKeyDown)
+		}
+	}, [handleKeyDown])
+
+	useImperativeHandle(ref, () => ({
+		acceptInput: () => {
+			if (enableButtons && primaryButtonText) {
+				handlePrimaryButtonClick(inputValue, selectedImages)
+			} else if (!textAreaDisabled && (inputValue.trim() || selectedImages.length > 0)) {
+				handleSendMessage(inputValue, selectedImages)
+			}
+		},
+	}))
 
 	return (
 		<div
@@ -977,17 +1206,33 @@ const ChatView = ({ isHidden, showAnnouncement, hideAnnouncement, showHistoryVie
 				overflow: "hidden",
 			}}>
 			{task ? (
-				<TaskHeader
-					task={task}
-					tokensIn={apiMetrics.totalTokensIn}
-					tokensOut={apiMetrics.totalTokensOut}
-					doesModelSupportPromptCache={selectedModelInfo.supportsPromptCache}
-					cacheWrites={apiMetrics.totalCacheWrites}
-					cacheReads={apiMetrics.totalCacheReads}
-					totalCost={apiMetrics.totalCost}
-					contextTokens={apiMetrics.contextTokens}
-					onClose={handleTaskCloseButtonClick}
-				/>
+				<>
+					<TaskHeader
+						task={task}
+						tokensIn={apiMetrics.totalTokensIn}
+						tokensOut={apiMetrics.totalTokensOut}
+						doesModelSupportPromptCache={selectedModelInfo.supportsPromptCache}
+						cacheWrites={apiMetrics.totalCacheWrites}
+						cacheReads={apiMetrics.totalCacheReads}
+						totalCost={apiMetrics.totalCost}
+						contextTokens={apiMetrics.contextTokens}
+						onClose={handleTaskCloseButtonClick}
+					/>
+
+					{/* System prompt override warning */}
+					{hasSystemPromptOverride && (
+						<div className="px-3">
+							<SystemPromptWarning />
+						</div>
+					)}
+
+					{/* Checkpoint warning message */}
+					{showCheckpointWarning && (
+						<div className="px-3">
+							<CheckpointWarningMessage />
+						</div>
+					)}
+				</>
 			) : (
 				<div
 					style={{
@@ -998,17 +1243,10 @@ const ChatView = ({ isHidden, showAnnouncement, hideAnnouncement, showHistoryVie
 						flexDirection: "column",
 						paddingBottom: "10px",
 					}}>
+					{telemetrySetting === "unset" && <TelemetryBanner />}
 					{showAnnouncement && <Announcement version={version} hideAnnouncement={hideAnnouncement} />}
-					<div style={{ padding: "0 20px", flexShrink: 0 }}>
-						<h2>What can Roo do for you?</h2>
-						<p>
-							Thanks to the latest breakthroughs in agentic coding capabilities, I can handle complex
-							software development tasks step-by-step. With tools that let me create & edit files, explore
-							complex projects, use the browser, and execute terminal commands (after you grant
-							permission), I can assist you in ways that go beyond code completion or tech support. I can
-							even use MCP to create new tools and extend my own capabilities.
-						</p>
-					</div>
+
+					<RooHero />
 					{taskHistory.length > 0 && <HistoryPreview showHistoryView={showHistoryView} />}
 				</div>
 			)}
@@ -1078,7 +1316,8 @@ const ChatView = ({ isHidden, showAnnouncement, hideAnnouncement, showHistoryVie
 								onClick={() => {
 									scrollToBottomSmooth()
 									disableAutoScrollRef.current = false
-								}}>
+								}}
+								title={t("chat:scrollToBottom")}>
 								<span className="codicon codicon-chevron-down" style={{ fontSize: "18px" }}></span>
 							</ScrollToBottomButton>
 						</div>
@@ -1102,6 +1341,26 @@ const ChatView = ({ isHidden, showAnnouncement, hideAnnouncement, showHistoryVie
 										flex: secondaryButtonText ? 1 : 2,
 										marginRight: secondaryButtonText ? "6px" : "0",
 									}}
+									title={
+										primaryButtonText === t("chat:retry.title")
+											? t("chat:retry.tooltip")
+											: primaryButtonText === t("chat:save.title")
+												? t("chat:save.tooltip")
+												: primaryButtonText === t("chat:approve.title")
+													? t("chat:approve.tooltip")
+													: primaryButtonText === t("chat:runCommand.title")
+														? t("chat:runCommand.tooltip")
+														: primaryButtonText === t("chat:startNewTask.title")
+															? t("chat:startNewTask.tooltip")
+															: primaryButtonText === t("chat:resumeTask.title")
+																? t("chat:resumeTask.tooltip")
+																: primaryButtonText === t("chat:proceedAnyways.title")
+																	? t("chat:proceedAnyways.tooltip")
+																	: primaryButtonText ===
+																		  t("chat:proceedWhileRunning.title")
+																		? t("chat:proceedWhileRunning.tooltip")
+																		: undefined
+									}
 									onClick={(e) => handlePrimaryButtonClick(inputValue, selectedImages)}>
 									{primaryButtonText}
 								</VSCodeButton>
@@ -1114,8 +1373,19 @@ const ChatView = ({ isHidden, showAnnouncement, hideAnnouncement, showHistoryVie
 										flex: isStreaming ? 2 : 1,
 										marginLeft: isStreaming ? 0 : "6px",
 									}}
+									title={
+										isStreaming
+											? t("chat:cancel.tooltip")
+											: secondaryButtonText === t("chat:startNewTask.title")
+												? t("chat:startNewTask.tooltip")
+												: secondaryButtonText === t("chat:reject.title")
+													? t("chat:reject.tooltip")
+													: secondaryButtonText === t("chat:terminate.title")
+														? t("chat:terminate.tooltip")
+														: undefined
+									}
 									onClick={(e) => handleSecondaryButtonClick(inputValue, selectedImages)}>
-									{isStreaming ? "Cancel" : secondaryButtonText}
+									{isStreaming ? t("chat:cancel.title") : secondaryButtonText}
 								</VSCodeButton>
 							)}
 						</div>
@@ -1128,6 +1398,7 @@ const ChatView = ({ isHidden, showAnnouncement, hideAnnouncement, showHistoryVie
 				inputValue={inputValue}
 				setInputValue={setInputValue}
 				textAreaDisabled={textAreaDisabled}
+				selectApiConfigDisabled={textAreaDisabled && clineAsk !== "api_req_failed"}
 				placeholderText={placeholderText}
 				selectedImages={selectedImages}
 				setSelectedImages={setSelectedImages}
@@ -1141,12 +1412,15 @@ const ChatView = ({ isHidden, showAnnouncement, hideAnnouncement, showHistoryVie
 				}}
 				mode={mode}
 				setMode={setMode}
+				modeShortcutText={modeShortcutText}
 			/>
 
-			<div id="chat-view-portal" />
+			<div id="roo-portal" />
 		</div>
 	)
 }
+
+const ChatView = forwardRef(ChatViewComponent)
 
 const ScrollToBottomButton = styled.div`
 	background-color: color-mix(in srgb, var(--vscode-toolbar-hoverBackground) 55%, transparent);

@@ -1,6 +1,7 @@
 import { memo, useMemo } from "react"
-import { getLanguageFromPath } from "../../utils/getLanguageFromPath"
+import { getLanguageFromPath } from "@src/utils/getLanguageFromPath"
 import CodeBlock, { CODE_BLOCK_BG_COLOR } from "./CodeBlock"
+import { ToolProgressStatus } from "@roo/shared/ExtensionMessage"
 
 interface CodeAccordianProps {
 	code?: string
@@ -12,15 +13,20 @@ interface CodeAccordianProps {
 	isExpanded: boolean
 	onToggleExpand: () => void
 	isLoading?: boolean
+	progressStatus?: ToolProgressStatus
+	forceWrap?: boolean
 }
 
 /*
-We need to remove leading non-alphanumeric characters from the path in order for our leading ellipses trick to work.
-^: Anchors the match to the start of the string.
-[^a-zA-Z0-9]+: Matches one or more characters that are not alphanumeric.
-The replace method removes these matched characters, effectively trimming the string up to the first alphanumeric character.
+We need to remove certain leading characters from the path in order for our leading ellipses trick to work.
+However, we want to preserve all language characters (including CJK, Cyrillic, etc.) and only remove specific
+punctuation that might interfere with the ellipsis display.
 */
-export const removeLeadingNonAlphanumeric = (path: string): string => path.replace(/^[^a-zA-Z0-9]+/, "")
+export const removeLeadingNonAlphanumeric = (path: string): string => {
+	// Only remove specific punctuation characters that might interfere with ellipsis display
+	// Keep all language characters (including CJK, Cyrillic, etc.) and numbers
+	return path.replace(/^[/\\:*?"<>|]+/, "")
+}
 
 const CodeAccordian = ({
 	code,
@@ -32,6 +38,8 @@ const CodeAccordian = ({
 	isExpanded,
 	onToggleExpand,
 	isLoading,
+	progressStatus,
+	forceWrap,
 }: CodeAccordianProps) => {
 	const inferredLanguage = useMemo(
 		() => code && (language ?? (path ? getLanguageFromPath(path) : undefined)),
@@ -95,6 +103,14 @@ const CodeAccordian = ({
 						</>
 					)}
 					<div style={{ flexGrow: 1 }}></div>
+					{progressStatus && progressStatus.text && (
+						<>
+							{progressStatus.icon && <span className={`codicon codicon-${progressStatus.icon} mr-1`} />}
+							<span className="mr-1 ml-auto text-vscode-descriptionForeground">
+								{progressStatus.text}
+							</span>
+						</>
+					)}
 					<span className={`codicon codicon-chevron-${isExpanded ? "up" : "down"}`}></span>
 				</div>
 			)}
@@ -112,6 +128,7 @@ const CodeAccordian = ({
 							diff ??
 							""
 						).trim()}\n${"```"}`}
+						forceWrap={forceWrap}
 					/>
 				</div>
 			)}

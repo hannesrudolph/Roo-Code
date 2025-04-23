@@ -55,14 +55,29 @@ async function extractTextFromIPYNB(filePath: string): Promise<string> {
 }
 
 export function addLineNumbers(content: string, startLine: number = 1): string {
+	// If content is empty, return empty string - empty files should not have line numbers
+	// If content is empty but startLine > 1, return "startLine | " because we know the file is not empty
+	// but the content is empty at that line offset
+	if (content === "") {
+		return startLine === 1 ? "" : `${startLine} | \n`
+	}
+
+	// Split into lines and handle trailing newlines
 	const lines = content.split("\n")
+	const lastLineEmpty = lines[lines.length - 1] === ""
+	if (lastLineEmpty) {
+		lines.pop()
+	}
+
 	const maxLineNumberWidth = String(startLine + lines.length - 1).length
-	return lines
+	const numberedContent = lines
 		.map((line, index) => {
 			const lineNumber = String(startLine + index).padStart(maxLineNumberWidth, " ")
 			return `${lineNumber} | ${line}`
 		})
 		.join("\n")
+
+	return numberedContent + "\n"
 }
 // Checks if every line in the content has line numbers prefixed (e.g., "1 | content" or "123 | content")
 // Line numbers must be followed by a single pipe character (not double pipes)
@@ -71,17 +86,23 @@ export function everyLineHasLineNumbers(content: string): boolean {
 	return lines.length > 0 && lines.every((line) => /^\s*\d+\s+\|(?!\|)/.test(line))
 }
 
-// Strips line numbers from content while preserving the actual content
-// Handles formats like "1 | content", " 12 | content", "123 | content"
-// Preserves content that naturally starts with pipe characters
-export function stripLineNumbers(content: string): string {
+/**
+ * Strips line numbers from content while preserving the actual content.
+ *
+ * @param content The content to process
+ * @param aggressive When false (default): Only strips lines with clear number patterns like "123 | content"
+ *                   When true: Uses a more lenient pattern that also matches lines with just a pipe character,
+ *                   which can be useful when LLMs don't perfectly format the line numbers in diffs
+ * @returns The content with line numbers removed
+ */
+export function stripLineNumbers(content: string, aggressive: boolean = false): string {
 	// Split into lines to handle each line individually
 	const lines = content.split(/\r?\n/)
 
 	// Process each line
 	const processedLines = lines.map((line) => {
 		// Match line number pattern and capture everything after the pipe
-		const match = line.match(/^\s*\d+\s+\|(?!\|)\s?(.*)$/)
+		const match = aggressive ? line.match(/^\s*(?:\d+\s)?\|\s(.*)$/) : line.match(/^\s*\d+\s+\|(?!\|)\s?(.*)$/)
 		return match ? match[1] : line
 	})
 
@@ -110,16 +131,104 @@ export function truncateOutput(content: string, lineLimit?: number): string {
 		return content
 	}
 
-	const lines = content.split("\n")
-	if (lines.length <= lineLimit) {
+	// Count total lines
+	let totalLines = 0
+	let pos = -1
+	while ((pos = content.indexOf("\n", pos + 1)) !== -1) {
+		totalLines++
+	}
+	totalLines++ // Account for last line without newline
+
+	if (totalLines <= lineLimit) {
 		return content
 	}
 
 	const beforeLimit = Math.floor(lineLimit * 0.2) // 20% of lines before
 	const afterLimit = lineLimit - beforeLimit // remaining 80% after
-	return [
-		...lines.slice(0, beforeLimit),
-		`\n[...${lines.length - lineLimit} lines omitted...]\n`,
-		...lines.slice(-afterLimit),
-	].join("\n")
+
+	// Find start section end position
+	let startEndPos = -1
+	let lineCount = 0
+	pos = 0
+	while (lineCount < beforeLimit && (pos = content.indexOf("\n", pos)) !== -1) {
+		startEndPos = pos
+		lineCount++
+		pos++
+	}
+
+	// Find end section start position
+	let endStartPos = content.length
+	lineCount = 0
+	pos = content.length
+	while (lineCount < afterLimit && (pos = content.lastIndexOf("\n", pos - 1)) !== -1) {
+		endStartPos = pos + 1 // Start after the newline
+		lineCount++
+	}
+
+	const omittedLines = totalLines - lineLimit
+	const startSection = content.slice(0, startEndPos + 1)
+	const endSection = content.slice(endStartPos)
+	return startSection + `\n[...${omittedLines} lines omitted...]\n\n` + endSection
+}
+
+/**
+ * Applies run-length encoding to compress repeated lines in text.
+ * Only compresses when the compression description is shorter than the repeated content.
+ *
+ * @param content The text content to compress
+ * @returns The compressed text with run-length encoding applied
+ */
+export function applyRunLengthEncoding(content: string): string {
+	if (!content) {
+		return content
+	}
+
+	let result = ""
+	let pos = 0
+	let repeatCount = 0
+	let prevLine = null
+	let firstOccurrence = true
+
+	while (pos < content.length) {
+		const nextNewlineIdx = content.indexOf("\n", pos)
+		const currentLine = nextNewlineIdx === -1 ? content.slice(pos) : content.slice(pos, nextNewlineIdx + 1)
+
+		if (prevLine === null) {
+			prevLine = currentLine
+		} else if (currentLine === prevLine) {
+			repeatCount++
+		} else {
+			if (repeatCount > 0) {
+				const compressionDesc = `<previous line repeated ${repeatCount} additional times>\n`
+				if (compressionDesc.length < prevLine.length * (repeatCount + 1)) {
+					result += prevLine + compressionDesc
+				} else {
+					for (let i = 0; i <= repeatCount; i++) {
+						result += prevLine
+					}
+				}
+				repeatCount = 0
+			} else {
+				result += prevLine
+			}
+			prevLine = currentLine
+		}
+
+		pos = nextNewlineIdx === -1 ? content.length : nextNewlineIdx + 1
+	}
+
+	if (repeatCount > 0 && prevLine !== null) {
+		const compressionDesc = `<previous line repeated ${repeatCount} additional times>\n`
+		if (compressionDesc.length < prevLine.length * repeatCount) {
+			result += prevLine + compressionDesc
+		} else {
+			for (let i = 0; i <= repeatCount; i++) {
+				result += prevLine
+			}
+		}
+	} else if (prevLine !== null) {
+		result += prevLine
+	}
+
+	return result
 }

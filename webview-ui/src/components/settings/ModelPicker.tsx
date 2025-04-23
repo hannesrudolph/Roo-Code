@@ -1,12 +1,13 @@
-import { VSCodeLink } from "@vscode/webview-ui-toolkit/react"
-import debounce from "debounce"
 import { useMemo, useState, useCallback, useEffect, useRef } from "react"
-import { useMount } from "react-use"
-import { CaretSortIcon, CheckIcon } from "@radix-ui/react-icons"
+import { VSCodeLink } from "@vscode/webview-ui-toolkit/react"
+import { Trans } from "react-i18next"
+import { ChevronsUpDown, Check, X } from "lucide-react"
 
+import { ProviderSettings, ModelInfo } from "@roo/schemas"
+
+import { useAppTranslation } from "@/i18n/TranslationContext"
 import { cn } from "@/lib/utils"
 import {
-	Button,
 	Command,
 	CommandEmpty,
 	CommandGroup,
@@ -16,170 +17,173 @@ import {
 	Popover,
 	PopoverContent,
 	PopoverTrigger,
+	Button,
 } from "@/components/ui"
 
-import { useExtensionState } from "../../context/ExtensionStateContext"
-import { vscode } from "../../utils/vscode"
 import { normalizeApiConfiguration } from "./ApiOptions"
+import { ThinkingBudget } from "./ThinkingBudget"
 import { ModelInfoView } from "./ModelInfoView"
 
-type ModelProvider = "glama" | "openRouter" | "unbound" | "requesty" | "openAi"
+type ModelIdKey = keyof Pick<
+	ProviderSettings,
+	"glamaModelId" | "openRouterModelId" | "unboundModelId" | "requestyModelId" | "openAiModelId"
+>
 
-type ModelKeys<T extends ModelProvider> = `${T}Models`
-type ConfigKeys<T extends ModelProvider> = `${T}ModelId`
-type InfoKeys<T extends ModelProvider> = `${T}ModelInfo`
-type RefreshMessageType<T extends ModelProvider> = `refresh${Capitalize<T>}Models`
+type ModelInfoKey = keyof Pick<
+	ProviderSettings,
+	"glamaModelInfo" | "openRouterModelInfo" | "unboundModelInfo" | "requestyModelInfo" | "openAiCustomModelInfo"
+>
 
-interface ModelPickerProps<T extends ModelProvider = ModelProvider> {
+interface ModelPickerProps {
 	defaultModelId: string
-	modelsKey: ModelKeys<T>
-	configKey: ConfigKeys<T>
-	infoKey: InfoKeys<T>
-	refreshMessageType: RefreshMessageType<T>
-	refreshValues?: Record<string, any>
+	defaultModelInfo?: ModelInfo
+	models: Record<string, ModelInfo> | null
+	modelIdKey: ModelIdKey
+	modelInfoKey: ModelInfoKey
 	serviceName: string
 	serviceUrl: string
-	recommendedModel: string
-	allowCustomModel?: boolean
+	apiConfiguration: ProviderSettings
+	setApiConfigurationField: <K extends keyof ProviderSettings>(field: K, value: ProviderSettings[K]) => void
 }
 
 export const ModelPicker = ({
 	defaultModelId,
-	modelsKey,
-	configKey,
-	infoKey,
-	refreshMessageType,
-	refreshValues,
+	models,
+	modelIdKey,
+	modelInfoKey,
 	serviceName,
 	serviceUrl,
-	recommendedModel,
-	allowCustomModel = false,
+	apiConfiguration,
+	setApiConfigurationField,
+	defaultModelInfo,
 }: ModelPickerProps) => {
-	const [customModelId, setCustomModelId] = useState("")
-	const [isCustomModel, setIsCustomModel] = useState(false)
+	const { t } = useAppTranslation()
+
 	const [open, setOpen] = useState(false)
-	const [value, setValue] = useState(defaultModelId)
 	const [isDescriptionExpanded, setIsDescriptionExpanded] = useState(false)
-	const prevRefreshValuesRef = useRef<Record<string, any> | undefined>()
-
-	const { apiConfiguration, [modelsKey]: models, onUpdateApiConfig, setApiConfiguration } = useExtensionState()
-
-	const modelIds = useMemo(
-		() => (Array.isArray(models) ? models : Object.keys(models)).sort((a, b) => a.localeCompare(b)),
-		[models],
-	)
+	const isInitialized = useRef(false)
+	const searchInputRef = useRef<HTMLInputElement>(null)
+	const modelIds = useMemo(() => Object.keys(models ?? {}).sort((a, b) => a.localeCompare(b)), [models])
 
 	const { selectedModelId, selectedModelInfo } = useMemo(
 		() => normalizeApiConfiguration(apiConfiguration),
 		[apiConfiguration],
 	)
 
-	const onSelectCustomModel = useCallback(
-		(modelId: string) => {
-			setCustomModelId(modelId)
-			const modelInfo = { id: modelId }
-			const apiConfig = { ...apiConfiguration, [configKey]: modelId, [infoKey]: modelInfo }
-			setApiConfiguration(apiConfig)
-			onUpdateApiConfig(apiConfig)
-			setValue(modelId)
-			setOpen(false)
-			setIsCustomModel(false)
-		},
-		[apiConfiguration, configKey, infoKey, onUpdateApiConfig, setApiConfiguration],
-	)
+	const [searchValue, setSearchValue] = useState(selectedModelId || "")
 
 	const onSelect = useCallback(
 		(modelId: string) => {
-			const modelInfo = Array.isArray(models)
-				? { id: modelId } // For OpenAI models which are just strings
-				: models[modelId] // For other models that have full info objects
-			const apiConfig = { ...apiConfiguration, [configKey]: modelId, [infoKey]: modelInfo }
-			setApiConfiguration(apiConfig)
-			onUpdateApiConfig(apiConfig)
-			setValue(modelId)
+			if (!modelId) {
+				return
+			}
+
 			setOpen(false)
+			const modelInfo = models?.[modelId]
+			setApiConfigurationField(modelIdKey, modelId)
+			setApiConfigurationField(modelInfoKey, modelInfo ?? defaultModelInfo)
+
+			// Delay to ensure the popover is closed before setting the search value.
+			setTimeout(() => setSearchValue(modelId), 100)
 		},
-		[apiConfiguration, configKey, infoKey, models, onUpdateApiConfig, setApiConfiguration],
+		[modelIdKey, modelInfoKey, models, setApiConfigurationField, defaultModelInfo],
 	)
 
-	const debouncedRefreshModels = useMemo(() => {
-		return debounce(() => {
-			const message = refreshValues
-				? { type: refreshMessageType, values: refreshValues }
-				: { type: refreshMessageType }
-			vscode.postMessage(message)
-		}, 100)
-	}, [refreshMessageType, refreshValues])
+	const onOpenChange = useCallback(
+		(open: boolean) => {
+			setOpen(open)
 
-	useMount(() => {
-		debouncedRefreshModels()
-		return () => debouncedRefreshModels.clear()
-	})
+			// Abandon the current search if the popover is closed.
+			if (!open) {
+				// Delay to ensure the popover is closed before setting the search value.
+				setTimeout(() => setSearchValue(selectedModelId), 100)
+			}
+		},
+		[selectedModelId],
+	)
+
+	const onClearSearch = useCallback(() => {
+		setSearchValue("")
+		searchInputRef.current?.focus()
+	}, [])
 
 	useEffect(() => {
-		if (!refreshValues) {
-			prevRefreshValuesRef.current = undefined
-			return
+		if (!selectedModelId && !isInitialized.current) {
+			const initialValue = modelIds.includes(selectedModelId) ? selectedModelId : defaultModelId
+			setApiConfigurationField(modelIdKey, initialValue)
 		}
 
-		// Check if all values in refreshValues are truthy
-		if (Object.values(refreshValues).some((value) => !value)) {
-			prevRefreshValuesRef.current = undefined
-			return
-		}
-
-		// Compare with previous values
-		const prevValues = prevRefreshValuesRef.current
-		if (prevValues && JSON.stringify(prevValues) === JSON.stringify(refreshValues)) {
-			return
-		}
-
-		prevRefreshValuesRef.current = refreshValues
-		debouncedRefreshModels()
-	}, [debouncedRefreshModels, refreshValues])
-
-	useEffect(() => setValue(selectedModelId), [selectedModelId])
+		isInitialized.current = true
+	}, [modelIds, setApiConfigurationField, modelIdKey, selectedModelId, defaultModelId])
 
 	return (
 		<>
-			<div className="font-semibold">Model</div>
-			<Popover open={open} onOpenChange={setOpen}>
-				<PopoverTrigger asChild>
-					<Button variant="combobox" role="combobox" aria-expanded={open} className="w-full justify-between">
-						{value ?? "Select model..."}
-						<CaretSortIcon className="opacity-50" />
-					</Button>
-				</PopoverTrigger>
-				<PopoverContent align="start" className="p-0">
-					<Command>
-						<CommandInput placeholder="Search model..." className="h-9" />
-						<CommandList>
-							<CommandEmpty>No model found.</CommandEmpty>
-							<CommandGroup>
-								{modelIds.map((model) => (
-									<CommandItem key={model} value={model} onSelect={onSelect}>
-										{model}
-										<CheckIcon
-											className={cn("ml-auto", value === model ? "opacity-100" : "opacity-0")}
+			<div>
+				<label className="block font-medium mb-1">{t("settings:modelPicker.label")}</label>
+				<Popover open={open} onOpenChange={onOpenChange}>
+					<PopoverTrigger asChild>
+						<Button
+							variant="combobox"
+							role="combobox"
+							aria-expanded={open}
+							className="w-full justify-between">
+							<div>{selectedModelId ?? t("settings:common.select")}</div>
+							<ChevronsUpDown className="opacity-50" />
+						</Button>
+					</PopoverTrigger>
+					<PopoverContent className="p-0 w-[var(--radix-popover-trigger-width)]">
+						<Command>
+							<div className="relative">
+								<CommandInput
+									ref={searchInputRef}
+									value={searchValue}
+									onValueChange={setSearchValue}
+									placeholder={t("settings:modelPicker.searchPlaceholder")}
+									className="h-9 mr-4"
+									data-testid="model-input"
+								/>
+								{searchValue.length > 0 && (
+									<div className="absolute right-2 top-0 bottom-0 flex items-center justify-center">
+										<X
+											className="text-vscode-input-foreground opacity-50 hover:opacity-100 size-4 p-0.5 cursor-pointer"
+											onClick={onClearSearch}
 										/>
-									</CommandItem>
-								))}
-							</CommandGroup>
-							{allowCustomModel && (
-								<CommandGroup heading="Custom">
-									<CommandItem
-										onSelect={() => {
-											setIsCustomModel(true)
-											setOpen(false)
-										}}>
-										+ Add custom model
-									</CommandItem>
+									</div>
+								)}
+							</div>
+							<CommandList>
+								<CommandEmpty>
+									{searchValue && (
+										<div className="py-2 px-1 text-sm">
+											{t("settings:modelPicker.noMatchFound")}
+										</div>
+									)}
+								</CommandEmpty>
+								<CommandGroup>
+									{modelIds.map((model) => (
+										<CommandItem key={model} value={model} onSelect={onSelect}>
+											{model}
+											<Check
+												className={cn(
+													"size-4 p-0.5 ml-auto",
+													model === selectedModelId ? "opacity-100" : "opacity-0",
+												)}
+											/>
+										</CommandItem>
+									))}
 								</CommandGroup>
+							</CommandList>
+							{searchValue && !modelIds.includes(searchValue) && (
+								<div className="p-1 border-t border-vscode-input-border">
+									<CommandItem data-testid="use-custom-model" value={searchValue} onSelect={onSelect}>
+										{t("settings:modelPicker.useCustomModel", { modelId: searchValue })}
+									</CommandItem>
+								</div>
 							)}
-						</CommandList>
-					</Command>
-				</PopoverContent>
-			</Popover>
+						</Command>
+					</PopoverContent>
+				</Popover>
+			</div>
 			{selectedModelId && selectedModelInfo && (
 				<ModelInfoView
 					selectedModelId={selectedModelId}
@@ -188,37 +192,24 @@ export const ModelPicker = ({
 					setIsDescriptionExpanded={setIsDescriptionExpanded}
 				/>
 			)}
-			<p>
-				The extension automatically fetches the latest list of models available on{" "}
-				<VSCodeLink style={{ display: "inline", fontSize: "inherit" }} href={serviceUrl}>
-					{serviceName}.
-				</VSCodeLink>
-				If you're unsure which model to choose, Roo Code works best with{" "}
-				<VSCodeLink onClick={() => onSelect(recommendedModel)}>{recommendedModel}.</VSCodeLink>
-				You can also try searching "free" for no-cost options currently available.
-			</p>
-			{allowCustomModel && isCustomModel && (
-				<div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
-					<div className="bg-[var(--vscode-editor-background)] p-6 rounded-lg w-96">
-						<h3 className="text-lg font-semibold mb-4">Add Custom Model</h3>
-						<input
-							type="text"
-							className="w-full p-2 mb-4 bg-[var(--vscode-input-background)] text-[var(--vscode-input-foreground)] border border-[var(--vscode-input-border)] rounded"
-							placeholder="Enter model ID"
-							value={customModelId}
-							onChange={(e) => setCustomModelId(e.target.value)}
-						/>
-						<div className="flex justify-end gap-2">
-							<Button variant="secondary" onClick={() => setIsCustomModel(false)}>
-								Cancel
-							</Button>
-							<Button onClick={() => onSelectCustomModel(customModelId)} disabled={!customModelId.trim()}>
-								Add
-							</Button>
-						</div>
-					</div>
-				</div>
-			)}
+			<ThinkingBudget
+				apiConfiguration={apiConfiguration}
+				setApiConfigurationField={setApiConfigurationField}
+				modelInfo={selectedModelInfo}
+			/>
+			<div className="text-sm text-vscode-descriptionForeground">
+				<Trans
+					i18nKey="settings:modelPicker.automaticFetch"
+					components={{
+						serviceLink: <VSCodeLink href={serviceUrl} className="text-sm" />,
+						defaultModelLink: <VSCodeLink onClick={() => onSelect(defaultModelId)} className="text-sm" />,
+					}}
+					values={{
+						serviceName,
+						defaultModelId,
+					}}
+				/>
+			</div>
 		</>
 	)
 }
